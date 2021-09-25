@@ -10,12 +10,15 @@ import (
 
 const (
 	// magic cookie is a value prefixing every AOF chunk to enable finding the
-	// next chunk after corruption.
+	// next chunk after corruption. Note chose a cookie with all unique bytes to
+	// avoid two valid cookies overlapping.
 	magicCookie = 0x24716296
 
 	// maxChunkSize is the maximum size of the data in each chunk in the AOF,
 	// where a chunk is added on each call to Append.
 	maxChunkSize = 1024
+
+	chunkMetadataSize = 10
 
 	perm = 0600
 )
@@ -53,8 +56,8 @@ var (
 // Note the CRC32 is added at the end rather than in the header since it covers
 // the whole packet not just the data.
 type AOF struct {
-	rfile *os.File
-	wfile *os.File
+	rfile io.ReadSeekCloser
+	wfile io.WriteCloser
 }
 
 // NewAOF opens a new append-only file at the given path.
@@ -69,7 +72,16 @@ func NewAOF(path string) (*AOF, error) {
 		return nil, err
 	}
 
-	return &AOF{rfile, wfile}, nil
+	return newAOF(rfile, wfile)
+}
+
+// newAOF opens an AOF from the given reader and writer used for testing with
+// an in memory buffer.
+func newAOF(r io.ReadSeekCloser, w io.WriteCloser) (*AOF, error) {
+	return &AOF{
+		rfile: r,
+		wfile: w,
+	}, nil
 }
 
 // Append appends the given bytes to the file.
@@ -77,6 +89,8 @@ func NewAOF(path string) (*AOF, error) {
 // The length of b must be less than or equal to 1024. If the application needs
 // larger writes its up to the application to concatenate chunks. This is to
 // avoid excessive allocations/reads when the file is corrupted.
+//
+// If the process crashes mid append the data appended will be ignored.
 func (aof *AOF) Append(b []byte) error {
 	if len(b) > maxChunkSize {
 		return ErrChunkSizeLimitExceeded
@@ -112,77 +126,103 @@ func (aof *AOF) Append(b []byte) error {
 // Lookup will lookup the next chunk from offset and returns the data in this
 // chunk and the offset of the next chunk to read.
 func (aof *AOF) Lookup(offset int64) ([]byte, int64, error) {
-	ret, err := aof.rfile.Seek(offset, 0)
-	if err != nil {
-		return nil, 0, err
-	}
-	if ret != offset {
-		return nil, 0, io.EOF
-	}
-
-	sync := make([]byte, 4)
-	_, err = io.ReadFull(aof.rfile, sync)
-	if err != nil {
-		if err == io.ErrUnexpectedEOF { // TODO(AD) Refactor this into common.
-			return nil, 0, io.EOF
-		}
-		return nil, 0, err
-	}
-
-	// Keep reading until the next magic cookie is found.
-	// TODO(AD) Explain the test this properly.
-	// https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggdec.c#L331
-	var sp int64 = 0
 	for {
-		if isCookie(sync, sp) {
-			break
-		}
-
-		c, err := readU8(aof.rfile)
+		ret, err := aof.rfile.Seek(offset, 0)
 		if err != nil {
 			return nil, 0, err
 		}
-
-		sp += 1
-		sync[sp&3] = c
-	}
-
-	checksum := crc32.NewIEEE()
-
-	checksum.Write(sync)
-
-	size, err := readU16(aof.rfile)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Check the size before allocating a buffer incase the data is corrupt
-	// causing allocation errors.
-	if size > maxChunkSize {
-		// TODO(AD) Corrupt so restart.
-	}
-
-	checksum.Write(encodeU16(size))
-
-	b := make([]byte, size)
-	_, err = io.ReadFull(aof.rfile, b)
-	if err != nil {
-		if err == io.ErrUnexpectedEOF {
+		if ret != offset {
 			return nil, 0, io.EOF
 		}
-		return nil, 0, err
+
+		// Keep reading until the next magic cookie is found. Note this magic
+		// cookie may be in application data so the CRC would fail and continue
+		// searching from the next byte.
+		// This strategy of reading a 4 byte cookie by reading one byte at a time
+		// is from:
+		// https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggdec.c#L331
+		sync := make([]byte, 4)
+		_, err = io.ReadFull(aof.rfile, sync)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF { // TODO(AD) Refactor this into common.
+				return nil, 0, io.EOF
+			}
+			return nil, 0, err
+		}
+
+		// Keep adding one byte to the sync until is matches the expected cookie.
+		var sp int64 = 0
+		for {
+			if isCookie(sync, sp) {
+				break
+			}
+
+			c, err := readU8(aof.rfile)
+			if err != nil {
+				return nil, 0, err
+			}
+
+			offset += 1
+			sync[sp&3] = c
+			sp += 1
+		}
+
+		checksum := crc32.NewIEEE()
+
+		// Note sync may be out of order from the cookie.
+		checksum.Write(encodeU32(magicCookie))
+
+		size, err := readU16(aof.rfile)
+		if err != nil {
+			return nil, 0, err
+		}
+		// Check the size before allocating a buffer incase the data is corrupt
+		// causing allocation errors.
+		if size > maxChunkSize {
+			// Need to increase offset to avoid re-reading the same cookie again.
+			// Can ignore the bytes from the previously read cookie since all values
+			// in the cookie are unique.
+			offset += 1
+			continue
+		}
+
+		checksum.Write(encodeU16(size))
+
+		b := make([]byte, size)
+		_, err = io.ReadFull(aof.rfile, b)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				return nil, 0, io.EOF
+			}
+			return nil, 0, err
+		}
+
+		checksum.Write(b)
+
+		chunkChecksum, err := readU32(aof.rfile)
+		if err != nil {
+			return nil, 0, err
+		}
+		if checksum.Sum32() != chunkChecksum {
+			// Need to increase offset to avoid re-reading the same cookie again.
+			// Can ignore the bytes from the previously read cookie since all values
+			// in the cookie are unique.
+			offset += 1
+			continue
+		}
+
+		return b, offset + chunkMetadataSize + int64(len(b)), nil
 	}
+}
 
-	checksum.Write(b)
-
-	chunkChecksum, err := readU32(aof.rfile)
+func (aof *AOF) Close() error {
+	err := aof.rfile.Close()
 	if err != nil {
-		return nil, 0, err
+		// Return the first error but close the other file too.
+		aof.wfile.Close()
+		return err
 	}
-	if checksum.Sum32() != chunkChecksum {
-		// TODO(AD) Corrupt so restart
-	}
-
-	return b, offset + sp + 10 + int64(len(b)), nil
+	return aof.wfile.Close()
 }
 
 func isCookie(sync []byte, sp int64) bool {
